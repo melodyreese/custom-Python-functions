@@ -1,10 +1,5 @@
-# custom-Python-functions
-
-Objective:
-Approximate BIS values from raw EEG data using the Openibis algorithm and explore machine learning-based classification of depth of anesthesia (the brain’s response to anesthetic dose).
-
 EEG-Based BIS Estimation: openibis ML Pipeline
-==========================================================
+=========================================================
 Author  : Melody R. Smith
 Created : 2026-02-23
 Revised : 2026-02-25
@@ -13,6 +8,8 @@ Reference : Connor CW. Open Reimplementation of the BIS Algorithms for Depth
             of Anesthesia. Anesth Analg. 2022;135(4):855–864.
             https://doi.org/10.1213/ANE.0000000000006119
 Dataset   : https://figshare.com/articles/dataset/EEG_and_BIS_raw_data/5589841
+
+Objective : Approximate BIS values from raw EEG data using the Openibis algorithm and explore machine learning-based classification of depth of anesthesia (the brain’s response to anesthetic dose).
 
 Pipeline overview
 -----------------------------------------
