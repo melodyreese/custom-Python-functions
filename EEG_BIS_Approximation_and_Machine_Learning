@@ -1,0 +1,1122 @@
+
+import argparse
+import glob
+import os
+import math
+from itertools import permutations as iperms
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from scipy import signal
+from scipy.stats import pearsonr, spearmanr
+from xgboost import XGBClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, classification_report, roc_auc_score,
+    mean_absolute_error, precision_recall_fscore_support)
+
+np.random.seed(2026)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Path and Variable Configuration
+# ══════════════════════════════════════════════════════════════════════════════
+
+DATA_DIR    = 'C:/Users/mr455/Documents/Example EEG data/data/'
+RESULTS_DIR = r'C:\Users\mr455\Documents\Example EEG data\results'
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+FS                   = 128 # Assumed EEG sampling rate (Hz)
+EPOCH_SEC            = 4 # epoch length (seconds)
+EPOCH_SAMP           = FS * EPOCH_SEC
+EPOCH_STEP           = EPOCH_SAMP // 2 # 50% overlap, one output every 2 s
+ARTIFACT_THRESH_UV   = 100.0 # peak-to-peak amplitude rejection threshold
+EXPECTED_BIS_SEC     = 5.0 # expected BIS monitor output interval in Hz
+
+CATEGORIES = {'awake': 0, 'sedated': 1, 'anesthetized': 2, 'deep/BS': 3}
+CAT_LABELS  = list(CATEGORIES.keys())
+
+
+def bis_to_cat(bis):
+    """Map a BIS value to its depth-of-anesthesia category label"""
+    if   bis >= 80: return 'awake'
+    elif bis >= 60: return 'sedated'
+    elif bis >= 40: return 'anesthetized'
+    else:           return 'deep/BS'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Load and Inspect the Raw EEG Data
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_case(path):
+    """Load EEG and BIS vectors from a .mat file (HDF5 format)."""
+    import h5py
+    with h5py.File(path, 'r') as f:
+        eeg = np.array(f['EEG']).flatten().astype(float)
+        bis = np.array(f['bis']).flatten().astype(float)
+
+    dur_sec      = len(eeg) / FS
+    bis_interval = dur_sec / len(bis)
+
+    return eeg, bis, {
+        'case':             os.path.basename(path),
+        'eeg_samples':      len(eeg),
+        'bis_samples':      len(bis),
+        'eeg_dur_sec':      round(dur_sec, 1),
+        'bis_interval_sec': round(bis_interval, 2),
+        'bis_rate_hz':      round(1.0 / bis_interval, 3),
+        'ratio_eeg_bis':    round(len(eeg) / len(bis), 1)}
+
+
+def load_all_cases(data_dir):
+    """Load all case*.mat files and print a data characterisation table."""
+    paths = sorted(glob.glob(os.path.join(data_dir, 'case*.mat')))
+    if not paths:
+        raise FileNotFoundError(f"No case*.mat files found in '{data_dir}'")
+
+    cases, rows = [], []
+    for path in paths:
+        eeg, bis, meta = load_case(path)
+        cases.append((eeg, bis, meta))
+        rows.append(meta)
+
+    df = pd.DataFrame(rows).set_index('case')
+
+    mean_int = df['bis_interval_sec'].mean()
+    std_int  = df['bis_interval_sec'].std()
+    print(f"\n  BIS interval: {mean_int:.2f} ± {std_int:.2f} s across cases")
+    print(f"  EEG/BIS ratio: {df['ratio_eeg_bis'].mean():.1f} "
+          f"(expected {int(EXPECTED_BIS_SEC * FS)} at {EXPECTED_BIS_SEC} s interval)")
+
+    outliers = df[np.abs(df['bis_interval_sec'] - EXPECTED_BIS_SEC) > 1.0]
+    if not outliers.empty:
+        print("\n  WARNING: cases with BIS interval >1 s from expected:")
+        print(outliers[['bis_interval_sec', 'ratio_eeg_bis']].to_string())
+    else:
+        print(f"\n  All cases consistent with ~{EXPECTED_BIS_SEC} s BIS export interval")
+    return cases, df
+
+
+def plot_raw_eeg(eeg, case_name, max_sec=30, save=True):
+    """Figure 1: First 30 s of raw EEG for an example case."""
+    n = min(int(max_sec * FS), len(eeg))
+    t = np.arange(n) / FS
+
+    fig, ax = plt.subplots(figsize=(14, 3))
+    ax.plot(t, eeg[:n], lw=0.5, color='navy', alpha=0.85)
+    ax.set_title(f'First {max_sec}s of raw EEG for ({case_name})', fontsize=12)
+    ax.set_xlabel('Time (s)')
+    ax.set_ylabel('Amplitude (µV)')
+    plt.tight_layout()
+    if save:
+        fname = f'fig1_raw_eeg_{case_name}.png'
+        plt.savefig(os.path.join(RESULTS_DIR, fname), dpi=130, bbox_inches='tight')
+        print(f"[plot] Saved: {fname}")
+    plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Openibis Implementation
+# Runs on raw EEG with no preprocessing, no smoothing, accurate to the published algorithm.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def band_power_db(psd, freqs, fmin, fmax):
+    """Mean PSD in a frequency band, in dB (re 1 µV²/Hz)."""
+    mask = (freqs >= fmin) & (freqs <= fmax)
+    bp   = np.mean(psd[mask]) if mask.sum() > 0 else 1e-10
+    return 10 * np.log10(bp + 1e-10)
+
+
+def detect_burst_suppression(epoch, abs_threshold_uv=5.0, min_suppress_ms=500):
+    """
+    Burst suppression ratio (BSR) using a 5 µV absolute amplitude threshold.
+    Contiguous runs of at least min_suppress_ms where |amplitude| < 5 µV are
+    counted as suppressed. Returns the fraction of the epoch in suppression.
+    Note: the Aspect BIS monitor uses a proprietary multi-parameter BSR
+    algorithm (Connor 2025, OpenBSR); this is a clinical approximation.
+    """
+    min_samps  = int(min_suppress_ms / 1000 * FS)
+    suppressed = (np.abs(epoch) < abs_threshold_uv).astype(int)
+    n_sup, in_run, run_len = 0, False, 0
+    for s in suppressed:
+        if s:
+            in_run   = True
+            run_len += 1
+        else:
+            if in_run and run_len >= min_samps:
+                n_sup += run_len
+            in_run   = False
+            run_len  = 0
+    if in_run and run_len >= min_samps:
+        n_sup += run_len
+    return n_sup / len(epoch)
+
+
+def logistic_response(x, x50, slope):
+    return 100 / (1 + np.exp(slope * (x - x50)))
+
+
+def openibis_epoch(epoch, x50_ga=-5.0):
+    """Compute the openibis score for a single 4-second epoch."""
+    freqs, psd = signal.periodogram(epoch, fs=FS, window='hann')
+
+    db_total = band_power_db(psd, freqs, 0.5, 47)
+    db_low   = band_power_db(psd, freqs, 0.5,  4)
+    db_mid   = band_power_db(psd, freqs, 11,  20)
+    db_vhigh = band_power_db(psd, freqs, 40,  47)
+
+    ga_comp  = db_vhigh - db_total     # high-frequency relative power
+    sed_comp = db_mid   - db_total     # spindle-band relative power
+
+    score_ga  = logistic_response(ga_comp,  x50=x50_ga, slope=-0.5)
+    score_sed = logistic_response(sed_comp, x50=0,      slope=-0.6)
+
+    bsr       = detect_burst_suppression(epoch)
+    score_bsr = 100 * (1 - bsr)
+
+    # GA-sedation combination rule (Connor 2022, Eq. 3)
+    if score_ga < score_sed:
+        combined = 0.5 * (score_sed + score_ga) if (db_low - db_mid) <= 5 else score_ga
+    else:
+        combined = score_sed
+
+    provisional = 0.7 * combined + 0.3 * score_bsr
+
+    # Non-linear end-cap scaling (Connor 2022, Eq. 4)
+    if   provisional <= 10: final = 10 * (provisional / 10) ** 0.5
+    elif provisional >= 97: final = 97 + 3 * ((provisional - 97) / 3) ** 2
+    else:                   final = provisional
+
+    return float(np.clip(final, 0, 100))
+
+
+def openibis_epoch_components(epoch, x50_ga=-5.0):
+    """Return all intermediate sub-scores for diagnostic inspection."""
+    freqs, psd = signal.periodogram(epoch, fs=FS, window='hann')
+
+    db_total = band_power_db(psd, freqs, 0.5, 47)
+    db_low   = band_power_db(psd, freqs, 0.5,  4)
+    db_mid   = band_power_db(psd, freqs, 11,  20)
+    db_vhigh = band_power_db(psd, freqs, 40,  47)
+
+    ga_comp  = db_vhigh - db_total
+    sed_comp = db_mid   - db_total
+
+    score_ga  = logistic_response(ga_comp,  x50=x50_ga, slope=-0.5)
+    score_sed = logistic_response(sed_comp, x50=0,      slope=-0.6)
+
+    bsr       = detect_burst_suppression(epoch)
+    score_bsr = 100 * (1 - bsr)
+
+    if score_ga < score_sed:
+        combined = 0.5 * (score_sed + score_ga) if (db_low - db_mid) <= 5 else score_ga
+    else:
+        combined = score_sed
+
+    provisional = 0.7 * combined + 0.3 * score_bsr
+
+    if   provisional <= 10: final = 10 * (provisional / 10) ** 0.5
+    elif provisional >= 97: final = 97 + 3 * ((provisional - 97) / 3) ** 2
+    else:                   final = provisional
+
+    return {
+        'ga_comp': ga_comp, 'sed_comp': sed_comp,
+        'score_ga': score_ga, 'score_sed': score_sed,
+        'bsr': bsr, 'score_bsr': score_bsr,
+        'combined': combined, 'final': float(np.clip(final, 0, 100))}
+
+
+def calibrate_x50_ga(cases):
+    """
+    Estimate the dataset-specific GA logistic midpoint (x50_ga).
+    Connor's original x50_ga = -5 was calibrated on a 12-patient Brigham
+    dataset. Different EEG hardware shifts absolute gamma-band power, pushing
+    ga_comp into the logistic floor and collapsing every score to ~30.
+    Setting x50_ga = median(ga_comp) across all epochs centers the logistic
+    on this dataset while preserving function shape.
+    """
+    ga_comps = []
+    for eeg, bis, meta in cases:
+        n_steps = (len(eeg) - EPOCH_SAMP) // EPOCH_STEP + 1
+        for i in range(n_steps):
+            epoch      = eeg[i*EPOCH_STEP : i*EPOCH_STEP + EPOCH_SAMP]
+            freqs, psd = signal.periodogram(epoch, fs=FS, window='hann')
+            db_total   = band_power_db(psd, freqs, 0.5, 47)
+            db_vhigh   = band_power_db(psd, freqs, 40,  47)
+            ga_comps.append(db_vhigh - db_total)
+
+    x50_ga = float(np.median(ga_comps))
+    print("  Connor 2022 original x50_ga : -5.00")
+    print(f"  This dataset median ga_comp : {x50_ga:.2f}")
+    print(f"  Adopted x50_ga              : {x50_ga:.2f}")
+    print("  Rationale: centers the GA logistic on observed gamma-band")
+    return x50_ga
+
+
+def run_openibis(eeg, x50_ga=-5.0):
+    """Run openibis on raw EEG; returns one score per 2 s (50% overlap)."""
+    n_steps = (len(eeg) - EPOCH_SAMP) // EPOCH_STEP + 1
+    return np.array([
+        openibis_epoch(eeg[i*EPOCH_STEP : i*EPOCH_STEP + EPOCH_SAMP], x50_ga=x50_ga)
+        for i in range(n_steps)
+    ])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EEG Preprocessing and Feature Extraction
+# The openibis algorithm runs on raw EEG. This additional EEG feature set
+# uses separately preprocessed data.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def preprocess_eeg(eeg, notch_freq=60.0, bp_low=0.5, bp_high=47.0, order=4):
+    """Apply bandpass (0.5–47 Hz) and 60 Hz notch filter to raw EEG."""
+    nyq     = FS / 2.0
+    b_bp, a_bp = signal.butter(order, [bp_low / nyq, bp_high / nyq], btype='band')
+    eeg_f   = signal.filtfilt(b_bp, a_bp, eeg)
+    b_n, a_n   = signal.iirnotch(notch_freq / nyq, Q=30)
+    return signal.filtfilt(b_n, a_n, eeg_f)
+
+
+def spectral_edge_frequency(psd, freqs, edge=0.95):
+    """Frequency below which edge fraction of total power is contained."""
+    total = np.sum(psd)
+    if total == 0:
+        return 0.0
+    cumulative = np.cumsum(psd) / total
+    idx = np.searchsorted(cumulative, edge)
+    return float(freqs[min(idx, len(freqs) - 1)])
+
+
+def permutation_entropy(epoch, order=3, delay=1):
+    """Normalised permutation entropy (EEG complexity measure)."""
+    all_perms = {p: i for i, p in enumerate(iperms(range(order)))}
+    counts    = {}
+    for i in range(len(epoch) - delay * (order - 1)):
+        key = all_perms[tuple(np.argsort(epoch[i : i + delay * order : delay]))]
+        counts[key] = counts.get(key, 0) + 1
+    probs = np.array(list(counts.values()), dtype=float)
+    probs /= probs.sum()
+    return float(-np.sum(probs * np.log2(probs + 1e-10)) / np.log2(math.factorial(order)))
+
+
+def extract_features(epoch):
+    """
+    Extract spectral and complexity features from preprocessed EEG epochs.
+
+    Features:
+      - Band power (dB): delta, theta, alpha, beta, low-gamma, high-gamma, total
+      - Band power ratios: delta/beta, delta/alpha, alpha/beta, low-gamma/delta
+      - Spectral edge frequency: SEF50, SEF95
+      - Permutation entropy (complexity)
+      - Burst suppression ratio (BSR)
+    """
+    freqs, psd = signal.periodogram(epoch, fs=FS, window='hann')
+
+    def bp(lo, hi):
+        return band_power_db(psd, freqs, lo, hi)
+
+    bp_d   = bp(0.5,  4)
+    bp_th  = bp(4,    8)
+    bp_al  = bp(8,   13)
+    bp_be  = bp(13,  30)
+    bp_lg  = bp(30,  40)
+    bp_hg  = bp(40,  47)
+    bp_tot = bp(0.5, 47)
+
+    return {
+        # Absolute band powers
+        'bp_delta':           bp_d,
+        'bp_theta':           bp_th,
+        'bp_alpha':           bp_al,
+        'bp_beta':            bp_be,
+        'bp_low_gamma':       bp_lg,
+        'bp_high_gamma':      bp_hg,
+        'bp_total':           bp_tot,
+        # Band power ratios (log-domain differences)
+        'ratio_delta_beta':   bp_d  - bp_be,
+        'ratio_delta_alpha':  bp_d  - bp_al,
+        'ratio_alpha_beta':   bp_al - bp_be,
+        'ratio_lgamma_delta': bp_lg - bp_d,
+        # Spectral edge frequencies
+        'sef95':              spectral_edge_frequency(psd, freqs, edge=0.95),
+        'sef50':              spectral_edge_frequency(psd, freqs, edge=0.50),
+        # Complexity / suppression
+        'perm_entropy':       permutation_entropy(epoch),
+        'bsr':                detect_burst_suppression(epoch)}
+
+
+def build_feature_matrix(eeg_filtered):
+    """
+    Extract one feature vector per 4 s epoch (50% overlap, same grid as openibis).
+    Epochs with any sample exceeding the artifact threshold are flagged and
+    set to NaN (excluded from ML training and evaluation).
+    """
+    n_steps       = (len(eeg_filtered) - EPOCH_SAMP) // EPOCH_STEP + 1
+    rows, artifact_mask = [], np.zeros(n_steps, dtype=bool)
+    _keys = None
+
+    for i in range(n_steps):
+        epoch = eeg_filtered[i*EPOCH_STEP : i*EPOCH_STEP + EPOCH_SAMP]
+        if np.any(np.abs(epoch) > ARTIFACT_THRESH_UV):
+            artifact_mask[i] = True
+            if _keys is None:
+                _keys = list(extract_features(epoch).keys())
+            rows.append({k: np.nan for k in _keys})
+        else:
+            feats = extract_features(epoch)
+            if _keys is None:
+                _keys = list(feats.keys())
+            rows.append(feats)
+
+    return pd.DataFrame(rows), artifact_mask
+
+
+def align_bis_to_epochs(bis, n_epochs, bis_interval_sec):
+    """
+    Map each epoch index to the nearest ground-truth BIS sample.
+    Effective epoch step = EPOCH_STEP / FS = 2 s (both openibis and ML paths).
+    """
+    step_sec       = EPOCH_STEP / FS
+    epochs_per_bis = bis_interval_sec / step_sec
+    idx = np.array([min(int(i / epochs_per_bis), len(bis) - 1) for i in range(n_epochs)])
+    return bis[idx]
+
+
+def process_case(eeg, bis, meta, x50_ga=-5.0):
+    """
+    Process one case through both the openibis and ML feature extraction paths.
+
+    Both paths use 4-second epochs with 50% overlap (one output every 2 s).
+    openibis runs on raw EEG; ML features are extracted from filtered EEG.
+    Ground-truth BIS values < 0 are excluded from QC and classification 
+    but do not affect the openibis or feature extraction.
+    """
+    bis_interval = meta['bis_interval_sec']
+
+    # openibis path: raw EEG
+    oib_scores  = run_openibis(eeg, x50_ga=x50_ga)
+    n_ep        = len(oib_scores)
+    aligned_bis = align_bis_to_epochs(bis, n_ep, bis_interval)
+
+    # ML feature path: preprocessed EEG
+    features_df, art_mask = build_feature_matrix(preprocess_eeg(eeg))
+
+    # Align to shortest (should all be equal; clip for safety)
+    n_ep = min(n_ep, len(aligned_bis), len(features_df))
+    features_df = features_df.iloc[:n_ep].copy()
+    art_mask    = art_mask[:n_ep]
+    oib_scores  = oib_scores[:n_ep]
+    aligned_bis = aligned_bis[:n_ep]
+
+    features_df['bis_oib']   = oib_scores
+    features_df['bis_truth'] = aligned_bis
+    features_df['cat_oib']   = [CATEGORIES[bis_to_cat(b)] for b in oib_scores]
+    features_df['cat_truth'] = [
+        CATEGORIES[bis_to_cat(b)] if b >= 0 else np.nan for b in aligned_bis
+    ]
+    features_df['artifact']  = art_mask
+    features_df['case']      = meta['case']
+
+    return features_df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Quality Control
+# ══════════════════════════════════════════════════════════════════════════════
+
+def descriptive_stats(all_data_df):
+    """Per-case QC table: epoch counts, artifact rates, and BIS distributions."""
+    rows = []
+    for case, grp in all_data_df.groupby('case'):
+        clean  = grp[~grp['artifact'] & (grp['bis_truth'] >= 0)]
+        n_neg  = int((grp['bis_truth'] < 0).sum())
+        if clean.empty:
+            continue
+        q1, q3 = np.percentile(clean['bis_truth'], [25, 75])
+        rows.append({
+            'Case':             case,
+            'N epochs':         len(grp),
+            'N artifact':       int(grp['artifact'].sum()),
+            'N bis<0':          n_neg,
+            'Pct clean':        round(100 * len(clean) / len(grp), 1),
+            'BIS mean':         round(clean['bis_truth'].mean(), 1),
+            'BIS median':       round(clean['bis_truth'].median(), 1),
+            'BIS SD':           round(clean['bis_truth'].std(), 1),
+            'BIS min':          round(clean['bis_truth'].min(), 1),
+            'BIS Q1':           round(q1, 1),
+            'BIS Q3':           round(q3, 1),
+            'BIS max':          round(clean['bis_truth'].max(), 1)})
+
+    df = pd.DataFrame(rows).set_index('Case')
+    print(df.to_string())
+    return df
+
+
+def save_cohort_tables(all_data_df, desc_df):
+    """Save cohort-level rejection and BIS summary CSVs."""
+    pct_rej = 100 - desc_df['Pct clean']
+    pd.DataFrame({
+        'Total cases':      [len(desc_df)],
+        'Mean % rejected':  [pct_rej.mean()],
+        'Median % rejected':[pct_rej.median()],
+        'SD % rejected':    [pct_rej.std()],
+        'Min % rejected':   [pct_rej.min()],
+        'Max % rejected':   [pct_rej.max()],
+    }).to_csv(os.path.join(RESULTS_DIR, 'cohort_rejection_summary.csv'), index=False)
+
+    clean = all_data_df[~all_data_df['artifact'] & (all_data_df['bis_truth'] >= 0)]
+    pd.DataFrame({
+        'Mean BIS':         [clean['bis_truth'].mean()],
+        'Median BIS':       [clean['bis_truth'].median()],
+        'SD BIS':           [clean['bis_truth'].std()],
+        'Min BIS':          [clean['bis_truth'].min()],
+        'Q1 BIS':           [clean['bis_truth'].quantile(0.25)],
+        'Q3 BIS':           [clean['bis_truth'].quantile(0.75)],
+        'Max BIS':          [clean['bis_truth'].max()],
+        'Total clean epochs':[len(clean)],
+    }).to_csv(os.path.join(RESULTS_DIR, 'cohort_bis_descriptive_stats.csv'), index=False)
+
+    print("Saved cohort summary tables.")
+
+
+def save_bis_descriptive_stats(all_data_df):
+    """
+    Cohort-level descriptive statistics for ground-truth BIS and openibis scores.
+    Saves one row per measure to results/bis_descriptive_stats_cohort.csv.
+    """
+    clean = all_data_df[
+        ~all_data_df['artifact'] & (all_data_df['bis_truth'] >= 0)
+    ].dropna(subset=['bis_truth', 'bis_oib'])
+
+    def _stats(vals, label):
+        return {
+            'measure':  label,
+            'n_epochs': len(vals),
+            'mean':     round(vals.mean(), 2),
+            'median':   round(vals.median(), 2),
+            'sd':       round(vals.std(), 2),
+            'min':      round(vals.min(), 2),
+            'q1':       round(vals.quantile(0.25), 2),
+            'q3':       round(vals.quantile(0.75), 2),
+            'max':      round(vals.max(), 2)}
+
+    rows = [
+        _stats(clean['bis_truth'], 'Ground-truth BIS'),
+        _stats(clean['bis_oib'],   'openibis')]
+
+    out_df = pd.DataFrame(rows)
+    out_path = os.path.join(RESULTS_DIR, 'bis_descriptive_stats_cohort.csv')
+    out_df.to_csv(out_path, index=False)
+    print("[saved] BIS descriptive stats → bis_descriptive_stats_cohort.csv")
+    return out_df
+
+def plot_bis_distributions(all_data_df, save=True):
+    """Figure 2: Ground-truth BIS vs openibis score distributions across all epochs."""
+    gt_vals  = all_data_df.loc[all_data_df['bis_truth'] >= 0, 'bis_truth']
+    oib_vals = all_data_df['bis_oib']
+    bins     = np.linspace(0, 100, 26)
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+    fig.suptitle('BIS distributions across all epochs and cases', fontsize=13)
+
+    axes[0].hist(gt_vals, bins=bins, color='steelblue', edgecolor='white', alpha=0.85)
+    axes[0].set_title(f'Ground-truth BIS\n(n = {len(gt_vals):,} epochs)', fontsize=10)
+    axes[0].set_xlabel('Ground-truth BIS'); axes[0].set_ylabel('Epoch count')
+
+    axes[1].hist(oib_vals, bins=bins, color='coral', edgecolor='white', alpha=0.85)
+    axes[1].set_title(f'openibis\n(n = {len(oib_vals):,} epochs)', fontsize=10)
+    axes[1].set_xlabel('openibis score')
+
+    plt.tight_layout()
+    if save:
+        plt.savefig(os.path.join(RESULTS_DIR, 'fig2_bis_distributions.png'),
+                    dpi=130, bbox_inches='tight')
+        print("[plot] Saved: fig2_bis_distributions.png")
+    plt.show()
+
+
+def estimate_lag(all_data_df, max_lag_sec=60):
+    """
+    Estimate the temporal offset between openibis and ground-truth BIS.
+    The Aspect BIS monitor applies internal smoothing before exporting, so
+    the ground-truth BIS trace lags behind instantaneous openibis scores.
+    The lag is measured empirically and used only for QC visualisation.
+    """
+    step_sec       = EPOCH_STEP / FS   # 2.0 s
+    max_lag_epochs = int(max_lag_sec / step_sec)
+
+    clean = all_data_df[
+        ~all_data_df['artifact'] & (all_data_df['bis_truth'] >= 0)
+    ].dropna(subset=['bis_truth', 'bis_oib'])
+
+    oib   = clean['bis_oib'].values   - clean['bis_oib'].mean()
+    truth = clean['bis_truth'].values - clean['bis_truth'].mean()
+
+    xcorr = np.correlate(oib, truth, mode='full')
+    lags  = np.arange(-(len(truth) - 1), len(oib))
+    mask  = (lags >= -max_lag_epochs) & (lags <= max_lag_epochs)
+
+    best_idx   = np.argmax(xcorr[mask])
+    lag_epochs = int(lags[mask][best_idx])
+    lag_sec    = lag_epochs * step_sec
+    norm       = np.sqrt(np.sum(oib**2) * np.sum(truth**2))
+    xcorr_peak = xcorr[mask][best_idx] / (norm + 1e-10)
+    print(f"  Estimated lag    : {lag_epochs:+d} epochs  ({lag_sec:+.0f} s)")
+    print(f"  Interpretation   : openibis {'leads' if lag_epochs > 0 else 'lags'} "
+          f"ground-truth BIS by {abs(lag_sec):.0f} s")
+    print(f"  Normalised xcorr : {xcorr_peak:.3f} at peak")
+    if lag_epochs > 0:
+        print("  Consistent with Aspect monitor smoothing or output delay.")
+
+    return lag_epochs, lag_sec, xcorr_peak
+
+
+def apply_lag_correction(series, lag_epochs):
+    """Shift openibis forward by lag_epochs; vacated positions become NaN."""
+    arr       = np.array(series, dtype=float)
+    corrected = np.full_like(arr, np.nan)
+    if   lag_epochs == 0:  return arr
+    elif lag_epochs  > 0:  corrected[:-lag_epochs] = arr[lag_epochs:]
+    else:                  corrected[-lag_epochs:]  = arr[:lag_epochs]
+    return corrected
+
+
+def openibis_agreement_stats(all_data_df, lag_epochs=0):
+    """
+    Openibis vs ground-truth BIS agreement statistics (epoch- and sample-level).
+    Sample-level: one openibis mean per ground-truth BIS monitor sample: 
+    the correct unit for Bland-Altman (avoids inflating n by ~2.5x).
+    """
+    clean = all_data_df[
+        ~all_data_df['artifact'] & (all_data_df['bis_truth'] >= 0)
+    ].dropna(subset=['bis_truth', 'bis_oib']).copy()
+
+    def _stats(label, oib_vals, truth_vals):
+        r_p, _ = pearsonr(truth_vals, oib_vals)
+        r_s, _ = spearmanr(truth_vals, oib_vals)
+        mae    = mean_absolute_error(truth_vals, oib_vals)
+        diff   = oib_vals - truth_vals
+        print(f"\n{label}")
+        print(f"  n              : {len(oib_vals):,}")
+        print(f"  Pearson r      : {r_p:.3f}")
+        print(f"  Spearman rho   : {r_s:.3f}")
+        print(f"  MAE            : {mae:.2f} BIS units")
+        print(f"  B-A bias ± SD  : {diff.mean():.2f} ± {diff.std():.2f}")
+        return r_p, r_s, mae, diff
+
+    r_p_ep, r_s_ep, mae_ep, diff_ep = _stats(
+        "Epoch-level (ground-truth BIS repeated ~2.5× per monitor sample):",
+        clean['bis_oib'].values, clean['bis_truth'].values)
+
+    # Sample-level: average openibis across epochs sharing the same BIS sample
+    ds_rows = []
+    for _, grp in clean.groupby('case'):
+        grp   = grp.reset_index(drop=True)
+        block = (grp['bis_truth'] != grp['bis_truth'].shift()).cumsum()
+        for _, blk in grp.groupby(block):
+            ds_rows.append({
+                'bis_truth': blk['bis_truth'].iloc[0],
+                'bis_oib':   blk['bis_oib'].mean(),
+            })
+    ds_df = pd.DataFrame(ds_rows)
+
+    r_p_ds, r_s_ds, mae_ds, diff_ds = _stats(
+        "Sample-level (one openibis mean per ground-truth BIS sample — for B-A):",
+        ds_df['bis_oib'].values, ds_df['bis_truth'].values)
+
+    print(f"{'═'*65}")
+
+    if lag_epochs == 0:
+        return (r_p_ep, r_s_ep, mae_ep, diff_ep,
+                r_p_ds, r_s_ds, mae_ds, diff_ds,
+                None, None, None, None, ds_df)
+
+    oib_corr = apply_lag_correction(clean['bis_oib'].values, lag_epochs)
+    valid    = ~np.isnan(oib_corr)
+    r_p_lc, r_s_lc, mae_lc, diff_lc = _stats(
+        f"Epoch-level lag-corrected (+{lag_epochs} epochs / +{lag_epochs*2} s):",
+        oib_corr[valid], clean['bis_truth'].values[valid])
+
+    return (r_p_ep, r_s_ep, mae_ep, diff_ep,
+            r_p_ds, r_s_ds, mae_ds, diff_ds,
+            r_p_lc, r_s_lc, mae_lc, diff_lc, ds_df)
+
+
+def plot_bland_altman(ds_df, lag_epochs=0, save=True):
+    """Figure 3: Bland-Altman plot (sample-level, with optional lag-corrected panel)."""
+    n_panels = 2 if lag_epochs != 0 else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=(7 * n_panels, 5), squeeze=False)
+    fig.suptitle('Bland-Altman: Openibis vs Ground-Truth BIS', fontsize=13)
+
+    def _ba_panel(ax, oib_vals, truth_vals, title):
+        diff = oib_vals - truth_vals
+        mean = (oib_vals + truth_vals) / 2
+        md, sd = diff.mean(), diff.std()
+        ax.scatter(mean, diff, s=8, alpha=0.30, color='steelblue')
+        ax.axhline(0,            color='gray',   lw=1,   ls=':')
+        ax.axhline(md,           color='red',    lw=2,   label=f'Bias = {md:.1f}')
+        ax.axhline(md + 1.96*sd, color='orange', lw=1.5, ls='--',
+                   label=f'+1.96 SD = {md+1.96*sd:.1f}')
+        ax.axhline(md - 1.96*sd, color='orange', lw=1.5, ls='--',
+                   label=f'−1.96 SD = {md-1.96*sd:.1f}')
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel('Mean of openibis and Ground-Truth BIS')
+        ax.set_ylabel('openibis − Ground-Truth BIS')
+        ax.legend(fontsize=9)
+
+    _ba_panel(axes[0, 0],
+              ds_df['bis_oib'].values, ds_df['bis_truth'].values,
+              'openibis approximation vs Ground-Truth BIS\n'
+              '(one openibis mean per monitor sample)')
+
+    if lag_epochs != 0:
+        oib_corr = apply_lag_correction(ds_df['bis_oib'].values, lag_epochs)
+        valid    = ~np.isnan(oib_corr)
+        _ba_panel(axes[0, 1],
+                  oib_corr[valid], ds_df['bis_truth'].values[valid],
+                  f'Lag-corrected (+{lag_epochs} epochs / +{lag_epochs*2} s)')
+
+    plt.tight_layout()
+    if save:
+        plt.savefig(os.path.join(RESULTS_DIR, 'fig3_bland_altman.png'),
+                    dpi=130, bbox_inches='tight')
+        print("[plot] Saved: fig3_bland_altman.png")
+    plt.show()
+
+
+def plot_openibis_components(comp_df, save=True):
+    """Diagnostic: distributions of openibis sub-components across sampled epochs."""
+    components = [
+        ('ga_comp',   'GA spectral component\n(db_vhigh − db_total)',     'slateblue'),
+        ('sed_comp',  'Sedation component\n(db_mid − db_total)',           'teal'),
+        ('score_ga',  'score_ga (logistic of ga_comp)',                   'mediumpurple'),
+        ('score_sed', 'score_sed (logistic of sed_comp)',                 'steelblue'),
+        ('bsr',       'BSR fraction (5 µV threshold)',                    'salmon'),
+        ('score_bsr', 'score_bsr (100 × (1 − BSR))',                     'tomato'),
+        ('combined',  'Combined score (min-rule)',                        'goldenrod'),
+        ('final',     'Final openibis score',                             'coral'),
+    ]
+    fig, axes = plt.subplots(2, 4, figsize=(18, 7))
+    fig.suptitle(
+        f'openibis Sub-Component Distributions '
+        f'(first {comp_df["case"].nunique()} cases)', fontsize=13)
+
+    for ax, (col, label, color) in zip(axes.flat, components):
+        vals = comp_df[col].dropna()
+        ax.hist(vals, bins=40, color=color, edgecolor='white', alpha=0.85)
+        ax.set_title(label, fontsize=9)
+        ax.axvline(vals.mean(),   color='black', lw=1.5, ls='--',
+                   label=f'mean={vals.mean():.1f}')
+        ax.axvline(vals.median(), color='red',   lw=1.5, ls=':',
+                   label=f'med={vals.median():.1f}')
+        ax.legend(fontsize=7)
+
+    plt.tight_layout()
+    if save:
+        plt.savefig(os.path.join(RESULTS_DIR, 'fig_openibis_components.png'),
+                    dpi=130, bbox_inches='tight')
+        print("[plot] Saved: fig_openibis_components.png")
+    plt.show()
+
+    print(f"\n{'═'*65}")
+    print(f"openibis SUB-COMPONENT SUMMARY ({comp_df['case'].nunique()} cases)")
+    print(f"{'─'*65}")
+    print(f"  {'Component':<16} {'Mean':>8} {'Median':>8} {'SD':>8} {'Min':>8} {'Max':>8}")
+    print(f"{'─'*65}")
+    for col, _, _ in components:
+        v = comp_df[col]
+        print(f"  {col:<16} {v.mean():>8.2f} {v.median():>8.2f} "
+              f"{v.std():>8.2f} {v.min():>8.2f} {v.max():>8.2f}")
+    print(f"{'═'*65}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Classification and Performance Output
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Feature sets used in the two XGBoost models
+OPENIBIS_ONLY_FEATURES = ['bis_oib']
+
+EEG_FEATURES = [
+    'bp_delta', 'bp_theta', 'bp_alpha', 'bp_beta',
+    'bp_low_gamma', 'bp_high_gamma', 'bp_total',
+    'ratio_delta_beta', 'ratio_delta_alpha', 'ratio_alpha_beta', 'ratio_lgamma_delta',
+    'sef95', 'sef50',
+    'perm_entropy', 'bsr']
+
+EEG_AND_OPENIBIS_FEATURES = EEG_FEATURES + OPENIBIS_ONLY_FEATURES
+
+
+def openibis_threshold_classifier(all_data_df):
+    """
+    Step 4a baseline: classify depth of anesthesia by applying the same
+    BIS thresholds to openibis scores — no machine learning involved.
+    This is the reference performance for the ML models to beat.
+    """
+    valid = all_data_df[
+        ~all_data_df['artifact'] &
+        (all_data_df['bis_truth'] >= 0) &
+        all_data_df['cat_truth'].notna()
+    ].copy()
+    valid['cat_oib_thresh'] = valid['bis_oib'].apply(
+        lambda b: CATEGORIES[bis_to_cat(b)])
+
+    y_true  = valid['cat_truth'].values.astype(int)
+    y_pred  = valid['cat_oib_thresh'].values.astype(int)
+    present = sorted(set(y_true))
+    labels  = [CAT_LABELS[i] for i in present]
+
+    acc                    = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _       = precision_recall_fscore_support(
+        y_true, y_pred, labels=present, average='macro', zero_division=0)
+
+    print("(BIS cut-points applied directly to openibis scores; no ML)")
+    print(f"Accuracy           : {acc:.3f}")
+    print(f"Precision (macro)  : {prec:.3f}")
+    print(f"Recall (macro)     : {rec:.3f}")
+    print(f"F1 (macro)         : {f1:.3f}")
+    print(classification_report(y_true, y_pred, labels=present,
+                                target_names=labels, zero_division=0))
+    print(f"{'═'*65}")
+    return acc, prec, rec, f1
+
+
+def run_xgb_loocv(all_data_df, feature_cols, model_name):
+    """
+    Case-level leave-one-out cross-validation (LOOCV).
+
+    For each fold: train on N=23 cases, evaluate on the held-out case.
+    Label: cat_truth (ground-truth BIS depth category).
+    Clean epochs only (no artifact, no sentinel BIS values).
+    """
+    valid = all_data_df[
+        ~all_data_df['artifact'] & (all_data_df['bis_truth'] >= 0)
+    ].dropna(subset=feature_cols + ['cat_truth'])
+
+    cases     = sorted(valid['case'].unique())
+    all_preds = []
+
+    print(f"\n{'═'*65}")
+    print(f"{model_name} — Case-Level LOOCV ({len(cases)} folds)")
+    print(f"{'─'*65}")
+
+    for test_case in cases:
+        train = valid[valid['case'] != test_case]
+        test  = valid[valid['case'] == test_case]
+        if train.empty or test.empty:
+            continue
+
+        X_tr = train[feature_cols].values
+        y_tr = train['cat_truth'].values.astype(int)
+        X_te = test[feature_cols].values
+        y_te = test['cat_truth'].values.astype(int)
+
+        scaler   = StandardScaler()
+        X_tr     = scaler.fit_transform(X_tr)
+        X_te     = scaler.transform(X_te)
+
+        clf = XGBClassifier(
+            n_estimators=200, max_depth=5, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8,
+            eval_metric='mlogloss', random_state=42, verbosity=0,
+        )
+        clf.fit(X_tr, y_tr)
+
+        y_pred  = clf.predict(X_te)
+        y_proba = clf.predict_proba(X_te)
+        acc     = accuracy_score(y_te, y_pred)
+        print(f"  {test_case:<14}  n={len(y_te):>5}  acc={acc:.3f}")
+
+        res = test[['case', 'bis_truth', 'bis_oib', 'cat_truth', 'cat_oib']].copy()
+        res['cat_pred'] = y_pred
+        for j, lbl in enumerate(CAT_LABELS):
+            res[f'prob_{lbl}'] = y_proba[:, j] if j < y_proba.shape[1] else np.nan
+        all_preds.append(res)
+
+    return pd.concat(all_preds, ignore_index=True), clf
+
+
+def report_performance(pred_df, model_name, baseline_acc):
+    """Print classification metrics for one XGBoost model."""
+    y_true  = pred_df['cat_truth'].values.astype(int)
+    y_pred  = pred_df['cat_pred'].values.astype(int)
+    present = sorted(set(y_true))
+    labels  = [CAT_LABELS[i] for i in present]
+
+    acc              = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=present, average='macro', zero_division=0)
+
+    prob_cols = [f'prob_{l}' for l in CAT_LABELS if f'prob_{l}' in pred_df.columns]
+    auc = (roc_auc_score(y_true, pred_df[prob_cols].values,
+                         multi_class='ovr', average='macro', labels=present)
+           if len(prob_cols) >= len(present) else np.nan)
+
+    print(f"\n{'═'*65}")
+    print(f"STEP 5 — {model_name} PERFORMANCE (LOOCV vs ground-truth BIS)")
+    print(f"{'─'*65}")
+    print(f"Accuracy           : {acc:.3f}  (openibis baseline: {baseline_acc:.3f})")
+    print(f"ROC-AUC (macro OvR): {auc:.3f}")
+    print(f"Precision (macro)  : {prec:.3f}")
+    print(f"Recall (macro)     : {rec:.3f}")
+    print(f"F1 (macro)         : {f1:.3f}")
+    print(classification_report(y_true, y_pred, labels=present,
+                                target_names=labels, zero_division=0))
+    print(f"{'═'*65}")
+    return acc, auc, prec, rec, f1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Feature Importance
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fit_final_model(all_data_df, feature_cols):
+    """Refit XGBoost on all clean data (for stable feature importance estimates)."""
+    clean = all_data_df[
+        ~all_data_df['artifact'] & (all_data_df['bis_truth'] >= 0)
+    ].dropna(subset=feature_cols + ['cat_truth'])
+
+    X = clean[feature_cols].values
+    y = clean['cat_truth'].values.astype(int)
+
+    scaler = StandardScaler()
+    X_s    = scaler.fit_transform(X)
+
+    clf = XGBClassifier(
+        n_estimators=200, max_depth=5, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric='mlogloss', random_state=42, verbosity=0,
+    )
+    clf.fit(X_s, y)
+    return clf
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Summary Figure
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_summary(all_data_df, pred_df_oib, pred_df_full, clf_final,
+                 lag_epochs=0, save=True):
+    """
+    Four-panel summary figure
+    """
+    fig = plt.figure(figsize=(18, 11))
+    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.35)
+
+    # ── Panel 1: Example time series ─────────────────────────────────────────
+    ax1   = fig.add_subplot(gs[0, :])
+    case0 = sorted(all_data_df['case'].unique())[0]
+    c_df  = all_data_df[all_data_df['case'] == case0].copy()
+    t_m   = np.arange(len(c_df)) * EPOCH_STEP / FS / 60
+
+    ax1.plot(t_m, c_df['bis_truth'], 'k-', lw=2,   label='Ground-truth BIS')
+    ax1.plot(t_m, c_df['bis_oib'],   'b-', lw=1.2, alpha=0.5, label='openibis (raw)')
+    if lag_epochs != 0:
+        oib_corr = apply_lag_correction(c_df['bis_oib'].values, lag_epochs)
+        ax1.plot(t_m, oib_corr, 'r-', lw=1.4, alpha=0.85,
+                 label=f'openibis (lag-corrected +{lag_epochs * 2} s)')
+
+    for thresh, color, alpha in [(40, 'green', 0.07), (80, 'blue', 0.05)]:
+        ax1.axhspan(thresh, thresh + 20, alpha=alpha, color=color)
+    ax1.set_title(f'Example BIS Time Series — {case0}', fontsize=12)
+    ax1.set_xlabel('Time (min)'); ax1.set_ylabel('BIS Score')
+    ax1.set_ylim(0, 115); ax1.legend(fontsize=9)
+
+    # ── Panel 2: Per-case LOOCV accuracy (full model) ───────────────────────
+    ax2 = fig.add_subplot(gs[1, 0])
+    case_accs = (
+        pred_df_full.groupby('case')
+        .apply(lambda g: accuracy_score(g['cat_truth'].astype(int),
+                                        g['cat_pred'].astype(int)))
+        .sort_values()
+    )
+    ax2.barh(range(len(case_accs)), case_accs.values, color='steelblue', alpha=0.8)
+    ax2.set_yticks(range(len(case_accs)))
+    ax2.set_yticklabels(
+        [c.replace('.mat', '') for c in case_accs.index], fontsize=7)
+    ax2.axvline(case_accs.mean(), color='red', lw=1.5, ls='--',
+                label=f'Mean = {case_accs.mean():.2f}')
+    ax2.set_xlabel('LOOCV Accuracy')
+    ax2.set_title('Per-Case LOOCV Accuracy\n(EEG + openibis model)', fontsize=10)
+    ax2.legend(fontsize=8)
+
+    # ── Panel 3: Accuracy bar chart across models ─────────────────────────────
+    ax3 = fig.add_subplot(gs[1, 1])
+    model_labels = ['openibis\nthreshold', 'XGBoost\nopenibis-only', 'XGBoost\nEEG + openibis']
+    accs_oib_thresh = accuracy_score(
+        all_data_df.loc[~all_data_df['artifact'] & (all_data_df['bis_truth'] >= 0) &
+                        all_data_df['cat_truth'].notna(), 'cat_truth'].astype(int),
+        all_data_df.loc[~all_data_df['artifact'] & (all_data_df['bis_truth'] >= 0) &
+                        all_data_df['cat_truth'].notna(), 'bis_oib']
+            .apply(lambda b: CATEGORIES[bis_to_cat(b)]).astype(int)
+    )
+    accs_oib_ml = accuracy_score(
+        pred_df_oib['cat_truth'].astype(int), pred_df_oib['cat_pred'].astype(int))
+    accs_full   = accuracy_score(
+        pred_df_full['cat_truth'].astype(int), pred_df_full['cat_pred'].astype(int))
+
+    bars = ax3.bar(model_labels, [accs_oib_thresh, accs_oib_ml, accs_full],
+                   color=['#aec7e8', '#6baed6', '#2171b5'], edgecolor='white')
+    for bar, val in zip(bars, [accs_oib_thresh, accs_oib_ml, accs_full]):
+        ax3.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                 f'{val:.3f}', ha='center', va='bottom', fontsize=9)
+    ax3.set_ylim(0, 1.0)
+    ax3.set_ylabel('Accuracy')
+    ax3.set_title('Model Accuracy Comparison\n(ground-truth BIS labels)', fontsize=10)
+
+    # ── Panel 4: Feature importance (top 10, full model) ─────────────────────
+    ax4  = fig.add_subplot(gs[1, 2])
+    imp  = pd.Series(clf_final.feature_importances_,
+                     index=EEG_AND_OPENIBIS_FEATURES).sort_values()
+    imp.tail(10).plot(kind='barh', ax=ax4, color='steelblue', alpha=0.85)
+    ax4.set_title('Step 6 — Top 10 Features\n(EEG + openibis model)', fontsize=10)
+    ax4.set_xlabel('Feature Importance (Gain)')
+
+    if save:
+        plt.savefig(os.path.join(RESULTS_DIR, 'fig_summary_results.png'),
+                    dpi=130, bbox_inches='tight')
+        print("[plot] Saved: fig_summary_results.png")
+    plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Following Analysis Plan Steps
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='EEG BIS Pipeline — openibis (Connor 2022) + XGBoost LOOCV')
+    parser.add_argument('--data_dir',    default=DATA_DIR)
+    parser.add_argument('--max_lag_sec', type=float, default=60.0)
+    parser.add_argument('--no_plot',     action='store_true')
+    args = parser.parse_args()
+
+    # ── Load and inspect raw EEG data ────────────────────────────────
+    cases, _ = load_all_cases(args.data_dir)
+
+    if not args.no_plot:
+        eeg0, _, meta0 = cases[0]
+        plot_raw_eeg(eeg0, meta0['case'])
+
+    # ── Openibis implementation ──────────────────────────────────────
+    # Calibrate the GA logistic midpoint to this dataset before processing
+    print("\n[calibration] Estimating ga_comp median for x50_ga recalibration...")
+    x50_ga = calibrate_x50_ga(cases)
+
+    print("\n[processing] Running openibis and extracting EEG features for all cases...")
+    all_frames = []
+    for eeg, bis, meta in cases:
+        print(f"  {meta['case']}...", end=' ', flush=True)
+        df    = process_case(eeg, bis, meta, x50_ga=x50_ga)
+        n_rej = int(df['artifact'].sum())
+        print(f"{len(df)} epochs, {n_rej} rejected ({100*n_rej/len(df):.1f}%)")
+        all_frames.append(df)
+
+    all_data_df = pd.concat(all_frames, ignore_index=True)
+    all_data_df.to_csv(os.path.join(RESULTS_DIR, 'all_epochs.csv'), index=False)
+
+    # Optional: inspect openibis sub-component distributions
+    print("\n[diagnostic] Computing openibis sub-components (first 5 cases)...")
+    comp_df = pd.DataFrame([
+        {**openibis_epoch_components(
+            eeg[i*EPOCH_STEP : i*EPOCH_STEP + EPOCH_SAMP], x50_ga=x50_ga),
+         'case': meta['case']}
+        for eeg, _, meta in cases[:5]
+        for i in range((len(eeg) - EPOCH_SAMP) // EPOCH_STEP + 1)])
+    if not args.no_plot:
+        plot_openibis_components(comp_df)
+
+    # ── Quality control ───────────────────────────────────────────────
+    desc_df = descriptive_stats(all_data_df)
+    desc_df.to_csv(os.path.join(RESULTS_DIR, 'descriptive_stats.csv'))
+    save_cohort_tables(all_data_df, desc_df)
+    save_bis_descriptive_stats(all_data_df)
+
+    if not args.no_plot:
+        plot_bis_distributions(all_data_df)
+
+    # Cross-lag estimation and Bland-Altman agreement
+    lag_epochs, lag_sec, _ = estimate_lag(all_data_df, max_lag_sec=args.max_lag_sec)
+
+    (r_p_ep, r_s_ep, mae_ep, diff_ep,
+     r_p_ds, r_s_ds, mae_ds, diff_ds,
+     r_p_lc, r_s_lc, mae_lc, diff_lc,
+     ds_df) = openibis_agreement_stats(all_data_df, lag_epochs=lag_epochs)
+
+    if not args.no_plot:
+        plot_bland_altman(ds_df, lag_epochs=lag_epochs)
+
+    # ── Openibis threshold baseline classifier ───────────────────────
+    oib_acc, oib_prec, oib_rec, oib_f1 = openibis_threshold_classifier(all_data_df)
+
+    # ── XGBoost — openibis scores only ───────────────────────────────
+    print("XGBoost classifier: openibis scores only")
+    pred_df_oib, _ = run_xgb_loocv(
+        all_data_df, OPENIBIS_ONLY_FEATURES, 'XGBoost (openibis-only)')
+    pred_df_oib.to_csv(
+        os.path.join(RESULTS_DIR, 'predictions_openibis_only.csv'), index=False)
+
+    acc_oib, auc_oib, prec_oib, rec_oib, f1_oib = report_performance(
+        pred_df_oib, 'XGBoost (openibis-only)', baseline_acc=oib_acc)
+
+    # ── XGBoost — EEG features + openibis ─────────────────
+    print("XGBoost classifier: EEG spectral features + openibis")
+    pred_df_full, clf_last_fold = run_xgb_loocv(
+        all_data_df, EEG_AND_OPENIBIS_FEATURES, 'XGBoost (EEG + openibis)')
+    pred_df_full.to_csv(
+        os.path.join(RESULTS_DIR, 'predictions_eeg_openibis.csv'), index=False)
+
+    acc_full, auc_full, prec_full, rec_full, f1_full = report_performance(
+        pred_df_full, 'XGBoost (EEG + openibis)', baseline_acc=oib_acc)
+
+    # ── Feature importance on model refit to all data ────────────
+    clf_final = fit_final_model(all_data_df, EEG_AND_OPENIBIS_FEATURES)
+    fi_df = pd.DataFrame({
+        'Feature':    EEG_AND_OPENIBIS_FEATURES,
+        'Importance': clf_final.feature_importances_,
+    }).sort_values('Importance', ascending=False)
+    fi_df.to_csv(os.path.join(RESULTS_DIR, 'feature_importance.csv'), index=False)
+    print("\n[saved] Feature importance table → feature_importance.csv")
+
+    # ── FINAL SUMMARY ─────────────────────────────────────────────────────────
+    print(f"  {'Method':<38} {'Metric':<25} {'Value'}")
+    rows = [
+        ('openibis agreement (sample-level)', 'Pearson r',        f'{r_p_ds:.3f}'),
+        ('openibis agreement (sample-level)', 'Spearman rho',     f'{r_s_ds:.3f}'),
+        ('openibis agreement (sample-level)', 'MAE (BIS units)',  f'{mae_ds:.2f}'),
+        ('openibis agreement (sample-level)', 'B-A bias ± SD',    f'{diff_ds.mean():.2f} ± {diff_ds.std():.2f}')]
+    if lag_epochs != 0 and r_p_lc is not None:
+        rows += [
+            (f'openibis (+{lag_sec:.0f}s lag-corrected)', 'Pearson r',    f'{r_p_lc:.3f}'),
+            (f'openibis (+{lag_sec:.0f}s lag-corrected)', 'Spearman rho', f'{r_s_lc:.3f}'),
+            (f'openibis (+{lag_sec:.0f}s lag-corrected)', 'MAE',          f'{mae_lc:.2f}')]
+    rows += [
+        ('openibis threshold',      'Accuracy',         f'{oib_acc:.3f}'),
+        ('openibis threshold',      'Precision (macro)',f'{oib_prec:.3f}'),
+        ('openibis threshold',      'Recall (macro)',   f'{oib_rec:.3f}'),
+        ('openibis threshold',      'F1 (macro)',       f'{oib_f1:.3f}'),
+        ('XGBoost openibis-only',   'Accuracy',         f'{acc_oib:.3f}'),
+        ('XGBoost openibis-only',   'ROC-AUC (macro)',  f'{auc_oib:.3f}'),
+        ('XGBoost openibis-only',   'Precision (macro)',f'{prec_oib:.3f}'),
+        ('XGBoost openibis-only',   'Recall (macro)',   f'{rec_oib:.3f}'),
+        ('XGBoost openibis-only',   'F1 (macro)',       f'{f1_oib:.3f}'),
+        ('XGBoost EEG + openibis',  'Accuracy',         f'{acc_full:.3f}'),
+        ('XGBoost EEG + openibis',  'ROC-AUC (macro)',  f'{auc_full:.3f}'),
+        ('XGBoost EEG + openibis',  'Precision (macro)',f'{prec_full:.3f}'),
+        ('XGBoost EEG + openibis',  'Recall (macro)',   f'{rec_full:.3f}'),
+        ('XGBoost EEG + openibis',  'F1 (macro)',       f'{f1_full:.3f}')]
+    for method, metric, val in rows:
+        print(f"  {method:<38} {metric:<25} {val}")
+    print(f"{'═'*72}")
+
+
+    if not args.no_plot:
+        plot_summary(all_data_df, pred_df_oib, pred_df_full, clf_final,
+                     lag_epochs=lag_epochs)
+
+if __name__ == '__main__':
+    import sys
+    sys.argv = ['eeg_bis_pipeline_v4.py']
+    main()
