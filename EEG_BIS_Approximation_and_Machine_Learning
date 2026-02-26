@@ -466,18 +466,6 @@ def save_cohort_tables(all_data_df, desc_df):
         'Max % rejected':   [pct_rej.max()],
     }).to_csv(os.path.join(RESULTS_DIR, 'cohort_rejection_summary.csv'), index=False)
 
-    clean = all_data_df[~all_data_df['artifact'] & (all_data_df['bis_truth'] >= 0)]
-    pd.DataFrame({
-        'Mean BIS':         [clean['bis_truth'].mean()],
-        'Median BIS':       [clean['bis_truth'].median()],
-        'SD BIS':           [clean['bis_truth'].std()],
-        'Min BIS':          [clean['bis_truth'].min()],
-        'Q1 BIS':           [clean['bis_truth'].quantile(0.25)],
-        'Q3 BIS':           [clean['bis_truth'].quantile(0.75)],
-        'Max BIS':          [clean['bis_truth'].max()],
-        'Total clean epochs':[len(clean)],
-    }).to_csv(os.path.join(RESULTS_DIR, 'cohort_bis_descriptive_stats.csv'), index=False)
-
     print("Saved cohort summary tables.")
 
 
