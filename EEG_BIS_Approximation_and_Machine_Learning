@@ -854,9 +854,7 @@ def report_performance(pred_df, model_name, baseline_acc):
                          multi_class='ovr', average='macro', labels=present)
            if len(prob_cols) >= len(present) else np.nan)
 
-    print(f"\n{'═'*65}")
-    print(f"STEP 5 — {model_name} PERFORMANCE (LOOCV vs ground-truth BIS)")
-    print(f"{'─'*65}")
+    print(f"{model_name} PERFORMANCE (LOOCV vs ground-truth BIS)")
     print(f"Accuracy           : {acc:.3f}  (openibis baseline: {baseline_acc:.3f})")
     print(f"ROC-AUC (macro OvR): {auc:.3f}")
     print(f"Precision (macro)  : {prec:.3f}")
