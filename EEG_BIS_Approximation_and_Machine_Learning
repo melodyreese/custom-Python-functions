@@ -656,8 +656,7 @@ def plot_bland_altman(ds_df, lag_epochs=0, save=True):
 
     _ba_panel(axes[0, 0],
               ds_df['bis_oib'].values, ds_df['bis_truth'].values,
-              'openibis approximation vs Ground-Truth BIS\n'
-              '(one openibis mean per monitor sample)')
+              'openibis approximation vs Ground-Truth BIS')
 
     if lag_epochs != 0:
         oib_corr = apply_lag_correction(ds_df['bis_oib'].values, lag_epochs)
